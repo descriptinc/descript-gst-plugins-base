@@ -231,9 +231,8 @@ gst_compositor_pad_set_property (GObject * object, guint prop_id,
 }
 
 static void
-_mixer_pad_get_output_size (GstCompositor * comp,
-    GstCompositorPad * comp_pad, gint out_par_n, gint out_par_d, gint * width,
-    gint * height)
+_mixer_pad_get_output_size (GstCompositorPad * comp_pad, gint out_par_n,
+    gint out_par_d, gint * width, gint * height)
 {
   GstVideoAggregatorPad *vagg_pad = GST_VIDEO_AGGREGATOR_PAD (comp_pad);
   gint pad_width, pad_height;
@@ -266,6 +265,9 @@ _mixer_pad_get_output_size (GstCompositor * comp,
       pad_height, dar_n, dar_d, GST_VIDEO_INFO_PAR_N (&vagg_pad->info),
       GST_VIDEO_INFO_PAR_D (&vagg_pad->info), out_par_n, out_par_d);
 
+  /* Pick either height or width, whichever is an integer multiple of the
+   * display aspect ratio. However, prefer preserving the height to account
+   * for interlaced video. */
   if (pad_height % dar_n == 0) {
     pad_width = gst_util_uint64_scale_int (pad_height, dar_n, dar_d);
   } else if (pad_width % dar_d == 0) {
@@ -280,7 +282,8 @@ _mixer_pad_get_output_size (GstCompositor * comp,
 
 /* Test whether rectangle2 contains rectangle 1 (geometrically) */
 static gboolean
-is_rectangle_contained (GstVideoRectangle rect1, GstVideoRectangle rect2)
+is_rectangle_contained (const GstVideoRectangle rect1,
+    const GstVideoRectangle rect2)
 {
   if ((rect2.x <= rect1.x) && (rect2.y <= rect1.y) &&
       ((rect2.x + rect2.w) >= (rect1.x + rect1.w)) &&
@@ -309,12 +312,47 @@ clamp_rectangle (gint x, gint y, gint w, gint h, gint outer_width,
   return clamped;
 }
 
+/* Call this with the lock taken */
+static gboolean
+_pad_obscures_rectangle (GstVideoAggregator * vagg, GstVideoAggregatorPad * pad,
+    const GstVideoRectangle rect, gboolean rect_transparent)
+{
+  GstVideoRectangle pad_rect;
+  GstCompositorPad *cpad = GST_COMPOSITOR_PAD (pad);
+
+  /* No buffer to obscure the rectangle with */
+  if (!gst_video_aggregator_pad_has_current_buffer (pad))
+    return FALSE;
+
+  /* Can't obscure if it's transparent and if the format has an alpha component
+   * we'd have to inspect every pixel to know if the frame is opaque, so assume
+   * it doesn't obscure. As a bonus, if the rectangle is fully transparent, we
+   * can also obscure it if we have alpha components on the pad */
+  if (!rect_transparent &&
+      (cpad->alpha != 1.0 || GST_VIDEO_INFO_HAS_ALPHA (&pad->info)))
+    return FALSE;
+
+  pad_rect.x = cpad->xpos;
+  pad_rect.y = cpad->ypos;
+  /* Handle pixel and display aspect ratios to find the actual size */
+  _mixer_pad_get_output_size (cpad, GST_VIDEO_INFO_PAR_N (&vagg->info),
+      GST_VIDEO_INFO_PAR_D (&vagg->info), &(pad_rect.w), &(pad_rect.h));
+
+  if (!is_rectangle_contained (rect, pad_rect))
+    return FALSE;
+
+  GST_DEBUG_OBJECT (pad, "Pad %s %ix%i@(%i,%i) obscures rect %ix%i@(%i,%i)",
+      GST_PAD_NAME (pad), pad_rect.w, pad_rect.h, pad_rect.x, pad_rect.y,
+      rect.w, rect.h, rect.x, rect.y);
+
+  return TRUE;
+}
+
 static gboolean
 gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
     GstVideoAggregator * vagg, GstBuffer * buffer,
     GstVideoFrame * prepared_frame)
 {
-  GstCompositor *comp = GST_COMPOSITOR (vagg);
   GstCompositorPad *cpad = GST_COMPOSITOR_PAD (pad);
   gint width, height;
   gboolean frame_obscured = FALSE;
@@ -335,7 +373,7 @@ gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
    *     width/height. See ->set_info()
    * */
 
-  _mixer_pad_get_output_size (comp, cpad, GST_VIDEO_INFO_PAR_N (&vagg->info),
+  _mixer_pad_get_output_size (cpad, GST_VIDEO_INFO_PAR_N (&vagg->info),
       GST_VIDEO_INFO_PAR_D (&vagg->info), &width, &height);
 
   if (cpad->alpha == 0.0) {
@@ -358,34 +396,8 @@ gst_compositor_pad_prepare_frame (GstVideoAggregatorPad * pad,
    * higher-zorder frames */
   l = g_list_find (GST_ELEMENT (vagg)->sinkpads, pad)->next;
   for (; l; l = l->next) {
-    GstVideoRectangle frame2_rect;
-    GstVideoAggregatorPad *pad2 = l->data;
-    GstCompositorPad *cpad2 = GST_COMPOSITOR_PAD (pad2);
-    gint pad2_width, pad2_height;
-
-    _mixer_pad_get_output_size (comp, cpad2, GST_VIDEO_INFO_PAR_N (&vagg->info),
-        GST_VIDEO_INFO_PAR_D (&vagg->info), &pad2_width, &pad2_height);
-
-    /* We don't need to clamp the coords of the second rectangle */
-    frame2_rect.x = cpad2->xpos;
-    frame2_rect.y = cpad2->ypos;
-    /* This is effectively what set_info and the above conversion
-     * code do to calculate the desired width/height */
-    frame2_rect.w = pad2_width;
-    frame2_rect.h = pad2_height;
-
-    /* Check if there's a buffer to be aggregated, ensure it can't have an alpha
-     * channel, then check opacity and frame boundaries */
-    if (gst_video_aggregator_pad_has_current_buffer (pad2)
-        && cpad2->alpha == 1.0 && !GST_VIDEO_INFO_HAS_ALPHA (&pad2->info)
-        && is_rectangle_contained (frame_rect, frame2_rect)) {
+    if (_pad_obscures_rectangle (vagg, l->data, frame_rect, FALSE)) {
       frame_obscured = TRUE;
-      GST_DEBUG_OBJECT (pad, "%ix%i@(%i,%i) obscured by %s %ix%i@(%i,%i) "
-          "in output of size %ix%i; skipping frame", frame_rect.w, frame_rect.h,
-          frame_rect.x, frame_rect.y, GST_PAD_NAME (pad2), frame2_rect.w,
-          frame2_rect.h, frame2_rect.x, frame2_rect.y,
-          GST_VIDEO_INFO_WIDTH (&vagg->info),
-          GST_VIDEO_INFO_HEIGHT (&vagg->info));
       break;
     }
   }
@@ -408,7 +420,6 @@ static void
 gst_compositor_pad_create_conversion_info (GstVideoAggregatorConvertPad * pad,
     GstVideoAggregator * vagg, GstVideoInfo * conversion_info)
 {
-  GstCompositor *comp = GST_COMPOSITOR (vagg);
   GstCompositorPad *cpad = GST_COMPOSITOR_PAD (pad);
   gint width, height;
 
@@ -418,7 +429,7 @@ gst_compositor_pad_create_conversion_info (GstVideoAggregatorConvertPad * pad,
   if (!conversion_info->finfo)
     return;
 
-  _mixer_pad_get_output_size (comp, cpad, GST_VIDEO_INFO_PAR_N (&vagg->info),
+  _mixer_pad_get_output_size (cpad, GST_VIDEO_INFO_PAR_N (&vagg->info),
       GST_VIDEO_INFO_PAR_D (&vagg->info), &width, &height);
 
   /* The only thing that can change here is the width
@@ -769,8 +780,7 @@ _fixate_caps (GstAggregator * agg, GstCaps * caps)
 
     fps_n = GST_VIDEO_INFO_FPS_N (&vaggpad->info);
     fps_d = GST_VIDEO_INFO_FPS_D (&vaggpad->info);
-    _mixer_pad_get_output_size (GST_COMPOSITOR (vagg), compositor_pad, par_n,
-        par_d, &width, &height);
+    _mixer_pad_get_output_size (compositor_pad, par_n, par_d, &width, &height);
 
     if (width == 0 || height == 0)
       continue;
@@ -829,33 +839,54 @@ _negotiated_caps (GstAggregator * agg, GstCaps * caps)
   return GST_AGGREGATOR_CLASS (parent_class)->negotiated_src_caps (agg, caps);
 }
 
-static GstFlowReturn
-gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
+static gboolean
+_should_draw_background (GstVideoAggregator * vagg, gboolean bg_transparent)
 {
+  GstVideoRectangle bg_rect;
+  gboolean draw = TRUE;
   GList *l;
-  GstCompositor *self = GST_COMPOSITOR (vagg);
-  BlendFunction composite;
-  GstVideoFrame out_frame, *outframe;
 
-  if (!gst_video_frame_map (&out_frame, &vagg->info, outbuf, GST_MAP_WRITE)) {
-    GST_WARNING_OBJECT (vagg, "Could not map output buffer");
-    return GST_FLOW_ERROR;
+  bg_rect.x = bg_rect.y = 0;
+
+  GST_OBJECT_LOCK (vagg);
+  bg_rect.w = GST_VIDEO_INFO_WIDTH (&vagg->info);
+  bg_rect.h = GST_VIDEO_INFO_HEIGHT (&vagg->info);
+  /* Check if the background is completely obscured by a pad
+   * TODO: Also skip if it's obscured by a combination of pads */
+  for (l = GST_ELEMENT (vagg)->sinkpads; l; l = l->next) {
+    if (_pad_obscures_rectangle (vagg, l->data, bg_rect, bg_transparent)) {
+      draw = FALSE;
+      break;
+    }
   }
+  GST_OBJECT_UNLOCK (vagg);
+  return draw;
+}
 
-  outframe = &out_frame;
-  /* default to blending */
-  composite = self->blend;
-  /* TODO: If the frames to be composited completely obscure the background,
-   * don't bother drawing the background at all. */
-  switch (self->background) {
+static gboolean
+_draw_background (GstVideoAggregator * vagg, GstVideoFrame * outframe,
+    BlendFunction * composite)
+{
+  GstCompositor *comp = GST_COMPOSITOR (vagg);
+
+  *composite = comp->blend;
+  /* If one of the frames to be composited completely obscures the background,
+   * don't bother drawing the background at all. We can also always use the
+   * 'blend' BlendFunction in that case because it only changes if we have to
+   * overlay on top of a transparent background. */
+  if (!_should_draw_background (vagg,
+          comp->background == COMPOSITOR_BACKGROUND_TRANSPARENT))
+    return FALSE;
+
+  switch (comp->background) {
     case COMPOSITOR_BACKGROUND_CHECKER:
-      self->fill_checker (outframe);
+      comp->fill_checker (outframe);
       break;
     case COMPOSITOR_BACKGROUND_BLACK:
-      self->fill_color (outframe, 16, 128, 128);
+      comp->fill_color (outframe, 16, 128, 128);
       break;
     case COMPOSITOR_BACKGROUND_WHITE:
-      self->fill_color (outframe, 240, 128, 128);
+      comp->fill_color (outframe, 240, 128, 128);
       break;
     case COMPOSITOR_BACKGROUND_TRANSPARENT:
     {
@@ -877,10 +908,42 @@ gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
         }
       }
       /* use overlay to keep background transparent */
-      composite = self->overlay;
+      *composite = comp->overlay;
       break;
     }
   }
+
+  return TRUE;
+}
+
+static gboolean
+frames_can_copy (const GstVideoFrame * frame1, const GstVideoFrame * frame2)
+{
+  if (GST_VIDEO_FRAME_FORMAT (frame1) != GST_VIDEO_FRAME_FORMAT (frame2))
+    return FALSE;
+  if (GST_VIDEO_FRAME_HEIGHT (frame1) != GST_VIDEO_FRAME_HEIGHT (frame2))
+    return FALSE;
+  if (GST_VIDEO_FRAME_WIDTH (frame1) != GST_VIDEO_FRAME_WIDTH (frame2))
+    return FALSE;
+  return TRUE;
+}
+
+static GstFlowReturn
+gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
+{
+  GList *l;
+  BlendFunction composite;
+  GstVideoFrame out_frame, *outframe;
+  gboolean drew_background;
+  guint drawn_pads = 0;
+
+  if (!gst_video_frame_map (&out_frame, &vagg->info, outbuf, GST_MAP_WRITE)) {
+    GST_WARNING_OBJECT (vagg, "Could not map output buffer");
+    return GST_FLOW_ERROR;
+  }
+
+  outframe = &out_frame;
+  drew_background = _draw_background (vagg, outframe, &composite);
 
   GST_OBJECT_LOCK (vagg);
   for (l = GST_ELEMENT (vagg)->sinkpads; l; l = l->next) {
@@ -906,9 +969,18 @@ gst_compositor_aggregate_frames (GstVideoAggregator * vagg, GstBuffer * outbuf)
     }
 
     if (prepared_frame != NULL) {
-      composite (prepared_frame,
-          compo_pad->xpos,
-          compo_pad->ypos, compo_pad->alpha, outframe, blend_mode);
+      /* If this is the first pad we're drawing, and we didn't draw the
+       * background, and @prepared_frame has the same format, height, and width
+       * as @outframe, then we can just copy it as-is. Subsequent pads (if any)
+       * will be composited on top of it. */
+      if (drawn_pads == 0 && !drew_background &&
+          frames_can_copy (prepared_frame, outframe))
+        gst_video_frame_copy (outframe, prepared_frame);
+      else
+        composite (prepared_frame,
+            compo_pad->xpos,
+            compo_pad->ypos, compo_pad->alpha, outframe, blend_mode);
+      drawn_pads++;
     }
   }
   GST_OBJECT_UNLOCK (vagg);
